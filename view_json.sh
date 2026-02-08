@@ -1,1 +1,0 @@
-docker exec -it hopeful_jones mongosh face_db --eval "db.identities.find()"
