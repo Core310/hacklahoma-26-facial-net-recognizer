@@ -1,6 +1,3 @@
-# Strict checker for new faces. Will ensure face not blurry and a bit more stable (hopefully less faces)
-
-
 import cv2
 import pyzed.sl as sl
 import numpy as np
@@ -20,7 +17,7 @@ DB_NAME = "face_db"
 COLLECTION_NAME = "identities"
 GFPGAN_MODEL_PATH = "GFPGANv1.3.pth"
 SIMILARITY_THRESHOLD = 0.5
-BLUR_THRESHOLD = 200  # Higher = Stricter (Reject more blurs)
+BLUR_THRESHOLD = 200  # Lower this if it's too strict (e.g. 100)
 
 
 # ==========================================
@@ -85,7 +82,6 @@ class FaceTracker:
 class RegistrationBuffer:
     def __init__(self, frames_needed=15):
         self.frames_needed = frames_needed
-        # { zed_id : frame_count }
         self.pending_counts = {}
 
     def update(self, zed_id):
@@ -141,7 +137,7 @@ class SmartFaceDB:
         self.last_refresh = time.time()
 
     def find_match(self, new_embedding):
-        """Only checks DB. Returns (Name, Score) or (None, 0.0)"""
+        """Returns (Name, Score, Gender, Age, Color)"""
         self.refresh_local_cache()
         new_norm = new_embedding / norm(new_embedding)
 
@@ -160,17 +156,15 @@ class SmartFaceDB:
                 best_score = score
                 best_match = face
 
-        # Dynamic Threshold (Standard 0.5)
+        # Match Found?
         if best_score > SIMILARITY_THRESHOLD:
             return best_match['name'], best_score, best_match['gender'], best_match['age'], (0, 255, 0)
 
         return None, best_score, "U", 0, (0, 0, 255)  # Unknown
 
     def register_new(self, new_embedding, age, gender, face_img):
-        """Creates new entry. Only call this after passing checks!"""
         new_norm = new_embedding / norm(new_embedding)
 
-        # Save Thumbnail
         img_str = ""
         try:
             if face_img is not None and face_img.size > 0:
@@ -260,7 +254,7 @@ def main():
     enhancer = FaceEnhancer()
     db = SmartFaceDB()
     tracker = FaceTracker(max_history=10)
-    reg_buffer = RegistrationBuffer(frames_needed=10)  # Wait ~10 frames before adding
+    reg_buffer = RegistrationBuffer(frames_needed=10)
 
     print("Opening ZED Camera...")
     zed = sl.Camera()
@@ -287,7 +281,7 @@ def main():
     depth_zed = sl.Mat()
     objects = sl.Objects()
 
-    print("\n✅ System Running! (Stricter Registration Enabled)")
+    print("\n✅ System Running!")
 
     while True:
         if zed.grab(rt_params) == sl.ERROR_CODE.SUCCESS:
@@ -304,7 +298,7 @@ def main():
                 box = face.bbox.astype(int)
                 face_width = box[2] - box[0]
 
-                # 1. Check Reality (ZED)
+                # 1. ZED Reality Check
                 is_real_person, zed_id = is_inside_zed_box(box, objects.object_list)
                 if not is_real_person:
                     cv2.rectangle(frame_bgr, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 2)
@@ -318,15 +312,14 @@ def main():
 
                 pose_status = estimate_yaw(face.kps)
 
-                # 2. Get Face Crop & Blur Score
+                # 2. Blur & Crop
                 h, w, _ = frame_bgr.shape
                 cx1, cy1 = max(0, box[0]), max(0, box[1])
                 cx2, cy2 = min(w, box[2]), min(h, box[3])
                 face_crop = frame_bgr[cy1:cy2, cx1:cx2]
-
                 blur_score = get_blur_score(face_crop)
 
-                # 3. Enhance if needed
+                # 3. Enhance Logic
                 embedding_to_use = face.embedding
                 was_enhanced = False
                 if face_width < 60 or distance > 2.0:
@@ -337,35 +330,29 @@ def main():
                             embedding_to_use = results_high_res[0].embedding
                             was_enhanced = True
                             face_crop = restored_face
-                            blur_score = 999  # Enhanced faces are artificial, assume good
+                            blur_score = 999
 
-                # 4. Check DB (No Creation yet)
+                            # 4. Check Match
                 name, score, gender, age, color = db.find_match(embedding_to_use)
 
                 if name:
-                    # Known Person
-                    reg_buffer.reset(zed_id)  # Reset counter
+                    # Match Found
+                    reg_buffer.reset(zed_id)
                     tracker.update(zed_id, name)
                     final_name = tracker.get_stable_name(zed_id)
                 else:
-                    # Unknown Person - Should we register?
+                    # Unknown - Strict Registration
                     final_name = "Unknown"
-                    color = (0, 165, 255)  # Orange
+                    color = (0, 165, 255)
 
-                    # --- STRICT REGISTRATION LOGIC ---
                     if zed_id is not None:
-                        # Only track if face is clear
                         if blur_score > BLUR_THRESHOLD and pose_status == "Center":
                             ready_to_register = reg_buffer.update(zed_id)
-
                             if ready_to_register:
                                 new_name = db.register_new(embedding_to_use, face.age, face.gender, face_crop)
                                 tracker.update(zed_id, new_name)
                                 final_name = new_name
                                 reg_buffer.reset(zed_id)
-                        else:
-                            # If blurry/side-view, pause registration
-                            pass
 
                 # Draw
                 cv2.rectangle(frame_bgr, (box[0], box[1]), (box[2], box[3]), color, 2)
@@ -374,8 +361,9 @@ def main():
                 label_top = f"{final_name} ({distance:.1f}m)"
                 cv2.putText(frame_bgr, label_top, (box[0], box[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-                # Show Blur Score for debugging
-                label_bot = f"Blur: {int(blur_score)} | {pose_status}"
+                # --- UPDATED BOTTOM LABEL ---
+                # Conf: 0.65 | Blur: 250 | Center
+                label_bot = f"Conf: {score:.2f} | Blur: {int(blur_score)} | {pose_status}"
                 cv2.putText(frame_bgr, label_bot, (box[0], box[3] + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200),
                             1)
 
