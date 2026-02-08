@@ -1,153 +1,188 @@
 import cv2
 import pyzed.sl as sl
 import numpy as np
-import os
-import pickle
 from numpy.linalg import norm
+import pymongo
 from insightface.app import FaceAnalysis
+import math
+
+# --- Configuration ---
+MONGO_URI = "mongodb://localhost:27017/"
+DB_NAME = "face_db"
+COLLECTION_NAME = "identities"
+
+# Standard threshold for close-up matches
+BASE_THRESHOLD = 0.5
 
 
-# ==========================================
-# PART 1: The Face Matcher Engine
-# ==========================================
-class FaceMatcher:
-    def __init__(self, db_path='face_db.pkl'):
-        self.db_path = db_path
-        self.known_faces = {}  # Format: {'name': embedding_norm}
-        self.load_db()
+class SmartFaceDB:
+    def __init__(self):
+        self.client = pymongo.MongoClient(MONGO_URI)
+        self.db = self.client[DB_NAME]
+        self.collection = self.db[COLLECTION_NAME]
+        self.known_faces = []
+        self.next_id = 1
+        self.refresh_local_cache()
 
-    def register_face(self, name, embedding):
-        """Saves a normalized embedding to the database."""
-        # Normalize: This makes cosine similarity much faster/easier
-        self.known_faces[name] = embedding / norm(embedding)
-        self.save_db()
-        print(f"✅ Registered: {name}")
+    def refresh_local_cache(self):
+        self.known_faces = []
+        cursor = self.collection.find()
+        max_id = 0
+        for doc in cursor:
+            embedding = np.array(doc['embedding'], dtype=np.float32)
+            self.known_faces.append({
+                'name': doc['name'],
+                'embedding': embedding / norm(embedding),
+                'age': doc.get('age', 0),
+                'gender': doc.get('gender', 'U')
+            })
+            if doc['name'].startswith("Person_"):
+                try:
+                    curr_id = int(doc['name'].split("_")[1])
+                    if curr_id > max_id: max_id = curr_id
+                except ValueError:
+                    pass
+        self.next_id = max_id + 1
+        print(f"Loaded {len(self.known_faces)} faces. Next ID: {self.next_id}")
 
-    def match_face(self, target_embedding, threshold=0.4):
-        """Compares input embedding against all known faces."""
-        if not self.known_faces:
-            return "Unknown", 0.0
+    def find_or_create(self, new_embedding, age, gender, distance):
+        """
+        Uses ZED distance to decide whether to Match, Create, or Ignore.
+        """
+        new_norm = new_embedding / norm(new_embedding)
 
-        # Normalize the incoming face
-        target_norm = target_embedding / norm(target_embedding)
+        # --- LOGIC 1: DYNAMIC THRESHOLD ---
+        # If closer than 1.5m, be strict (0.5).
+        # If farther, be looser (0.4) because low-res faces are 'noisier'.
+        current_threshold = BASE_THRESHOLD
+        if distance > 1.5:
+            current_threshold = 0.40
 
-        best_name = "Unknown"
-        best_score = -1.0
+        best_score = -1
+        best_match = None
 
-        for name, known_vec in self.known_faces.items():
-            # Cosine Similarity = Dot Product of normalized vectors
-            score = np.dot(target_norm, known_vec)
+        # Search Known Faces
+        for face in self.known_faces:
+            score = np.dot(new_norm, face['embedding'])
             if score > best_score:
                 best_score = score
-                best_name = name
+                best_match = face
 
-        if best_score >= threshold:
-            return best_name, best_score
-        return "Unknown", best_score
+        # MATCH FOUND?
+        if best_score > current_threshold:
+            return best_match['name'], best_score, best_match['gender'], best_match['age'], (0, 255, 0)
 
-    def save_db(self):
-        with open(self.db_path, 'wb') as f:
-            pickle.dump(self.known_faces, f)
+        # --- LOGIC 2: REGISTRATION GUARD ---
+        # If NO match found, should we create a new person?
 
-    def load_db(self):
-        if os.path.exists(self.db_path):
-            with open(self.db_path, 'rb') as f:
-                self.known_faces = pickle.load(f)
-            print(f"📂 Loaded {len(self.known_faces)} identities from database.")
+        # RULE: Only create new identities if the person is CLOSE (< 1.5m)
+        # This prevents creating "Person_55" just because you stood 3m away.
+        if distance > 1.5:
+            # Too far to be sure. Return "Unknown" but DO NOT save to DB.
+            return "Too Far to Register", best_score, "U", 0, (0, 0, 255)  # Red Color
+
+        # If we are here, we are Close + No Match + High Quality -> Create New
+        new_name = f"Person_{self.next_id}"
+        gender_str = "M" if gender == 1 else "F"
+
+        new_doc = {
+            "name": new_name,
+            "embedding": new_embedding.tolist(),
+            "age": int(age),
+            "gender": gender_str,
+            "created_at": "now"
+        }
+        self.collection.insert_one(new_doc)
+
+        self.known_faces.append({
+            'name': new_name,
+            'embedding': new_norm,
+            'age': int(age),
+            'gender': gender_str
+        })
+
+        self.next_id += 1
+        return new_name, best_score, gender_str, int(age), (0, 255, 0)
 
 
-# ==========================================
-# PART 2: Main Execution Loop (ZED + ArcFace)
-# ==========================================
 def main():
-    # 1. Initialize ArcFace (InsightFace)
-    # providers=['CUDAExecutionProvider'] is CRITICAL for Jetson Orin performance
     app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider'])
     app.prepare(ctx_id=0, det_size=(640, 640))
 
-    matcher = FaceMatcher()
+    db = SmartFaceDB()
 
-    # 2. Initialize ZED Camera
+    # ZED Init
     zed = sl.Camera()
     init_params = sl.InitParameters()
-    init_params.camera_resolution = sl.RESOLUTION.AUTO
-    init_params.depth_mode = sl.DEPTH_MODE.NEURAL  # Use ULTRA for higher precision
-    init_params.coordinate_units = sl.UNIT.CENTIMETER
+    init_params.camera_resolution = sl.RESOLUTION.HD720
+    # IMPORTANT: Use NEURAL depth if available for better far-range accuracy
+    init_params.depth_mode = sl.DEPTH_MODE.NEURAL
+    init_params.coordinate_units = sl.UNIT.METER
 
     if zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
-        print("❌ Failed to open ZED Camera")
+        print("ZED Error")
         return
 
-    # ZED Runtime Parameters
-    runtime_parameters = sl.RuntimeParameters()
-
-    # Pre-allocate ZED memory
+    rt_params = sl.RuntimeParameters()
     image_zed = sl.Mat()
-    depth_zed = sl.Mat()
+    depth_zed = sl.Mat()  # <--- Needed for distance
 
-    print("\nControls:")
-    print("  [R] - Register the largest detected face")
-    print("  [Q] - Quit")
+    print("Running... Press 'q' to quit.")
 
     while True:
-        if zed.grab(runtime_parameters) == sl.ERROR_CODE.SUCCESS:
-            # --- Capture Data ---
+        if zed.grab(rt_params) == sl.ERROR_CODE.SUCCESS:
             zed.retrieve_image(image_zed, sl.VIEW.LEFT)
-            zed.retrieve_measure(depth_zed, sl.MEASURE.DEPTH)
+            zed.retrieve_measure(depth_zed, sl.MEASURE.DEPTH)  # <--- Get Depth Map
 
-            # Convert to standard OpenCV format (Drop Alpha channel: BGRA -> BGR)
             frame_bgra = image_zed.get_data()
-            frame_bgr = frame_bgra[:, :, :3].copy()  # Make a copy to ensure memory continuity
+            frame_bgr = frame_bgra[:, :, :3].copy()
 
-            # --- AI Inference ---
             faces = app.get(frame_bgr)
-
-            # Sort faces by size (largest first) to handle the primary user easily
-            faces.sort(key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]), reverse=True)
 
             for face in faces:
                 box = face.bbox.astype(int)
 
-                # 1. Depth Check (Anti-Spoofing Lite)
+                # 1. GET REAL DISTANCE FROM ZED
+                # Find center of face
                 center_x = int((box[0] + box[2]) / 2)
                 center_y = int((box[1] + box[3]) / 2)
+
+                # Handle edge cases (face partly off screen)
+                h, w, _ = frame_bgr.shape
+                center_x = max(0, min(center_x, w - 1))
+                center_y = max(0, min(center_y, h - 1))
+
                 err, distance = depth_zed.get_value(center_x, center_y)
 
-                # 2. Identify
-                name, score = matcher.match_face(face.embedding)
+                # If ZED returns 'NaN' or infinity, assume far away
+                if not math.isfinite(distance):
+                    distance = 10.0
 
-                # 3. Visualization
-                color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
+                # 2. RUN INTELLIGENT DB CHECK
+                name, score, gender, age, color = db.find_or_create(
+                    face.embedding,
+                    face.age,
+                    face.gender,
+                    distance  # <--- Pass distance to logic
+                )
 
-                # Draw Box
+                # Visuals
+                # Top: Name + Dist
+                label_top = f"{name} ({distance:.1f}m)"
+                cv2.putText(frame_bgr, label_top, (box[0], box[1] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+                # Bottom: Score + Info
+                label_bot = f"Conf: {score:.2f} | {gender} {age}"
+                cv2.putText(frame_bgr, label_bot, (box[0], box[3] + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
                 cv2.rectangle(frame_bgr, (box[0], box[1]), (box[2], box[3]), color, 2)
 
-                # Draw Labels
-                label_id = f"{name} ({score:.2f})"
-                label_dist = f"Dist: {distance:.2f}m"
+            cv2.imshow("ZED Smart DB", frame_bgr)
 
-                cv2.putText(frame_bgr, label_id, (box[0], box[1] - 25),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                cv2.putText(frame_bgr, label_dist, (box[0], box[1] - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-
-            cv2.imshow("ZED 2i Face Matcher", frame_bgr)
-
-            # --- Key Inputs ---
-            key = cv2.waitKey(1) & 0xFF
-
-            if key == ord('q'):
+            if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-
-            # Registration Mode: Press 'r' to save the current largest face
-            elif key == ord('r'):
-                if len(faces) > 0:
-                    primary_face = faces[0]  # Largest face
-                    # Ask user for name in console
-                    new_name = input("Enter name for this person: ")
-                    matcher.register_face(new_name, primary_face.embedding)
-                else:
-                    print("⚠️ No face detected to register!")
 
     zed.close()
     cv2.destroyAllWindows()
