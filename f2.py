@@ -1,3 +1,6 @@
+# Strict checker for new faces. Will ensure face not blurry and a bit more stable (hopefully less faces)
+
+
 import cv2
 import pyzed.sl as sl
 import numpy as np
@@ -7,6 +10,9 @@ from insightface.app import FaceAnalysis
 from gfpgan import GFPGANer
 import os
 import math
+import base64
+import time
+from collections import deque, Counter
 
 # --- Configuration ---
 MONGO_URI = "mongodb://localhost:27017/"
@@ -14,6 +20,7 @@ DB_NAME = "face_db"
 COLLECTION_NAME = "identities"
 GFPGAN_MODEL_PATH = "GFPGANv1.3.pth"
 SIMILARITY_THRESHOLD = 0.5
+BLUR_THRESHOLD = 200  # Higher = Stricter (Reject more blurs)
 
 
 # ==========================================
@@ -32,7 +39,6 @@ class FaceEnhancer:
     def enhance(self, full_frame, box):
         x1, y1, x2, y2 = box
         h, w, _ = full_frame.shape
-
         pad = 10
         x1 = max(0, x1 - pad)
         y1 = max(0, y1 - pad)
@@ -53,7 +59,53 @@ class FaceEnhancer:
 
 
 # ==========================================
-# PART 2: Database Logic
+# PART 2: Trackers & Buffers
+# ==========================================
+class FaceTracker:
+    def __init__(self, max_history=10):
+        self.max_history = max_history
+        self.history = {}
+
+    def update(self, zed_id, name):
+        if zed_id not in self.history:
+            self.history[zed_id] = deque(maxlen=self.max_history)
+        self.history[zed_id].append(name)
+
+    def get_stable_name(self, zed_id):
+        if zed_id not in self.history or not self.history[zed_id]:
+            return "Scanning..."
+        votes = Counter(self.history[zed_id])
+        winner, count = votes.most_common(1)[0]
+        if count / len(self.history[zed_id]) > 0.5:
+            return winner
+        else:
+            return "Verifying..."
+
+
+class RegistrationBuffer:
+    def __init__(self, frames_needed=15):
+        self.frames_needed = frames_needed
+        # { zed_id : frame_count }
+        self.pending_counts = {}
+
+    def update(self, zed_id):
+        """Returns True if this ID has been waiting long enough to register."""
+        if zed_id not in self.pending_counts:
+            self.pending_counts[zed_id] = 0
+
+        self.pending_counts[zed_id] += 1
+
+        if self.pending_counts[zed_id] > self.frames_needed:
+            return True
+        return False
+
+    def reset(self, zed_id):
+        if zed_id in self.pending_counts:
+            del self.pending_counts[zed_id]
+
+
+# ==========================================
+# PART 3: Database Logic
 # ==========================================
 class SmartFaceDB:
     def __init__(self):
@@ -62,9 +114,12 @@ class SmartFaceDB:
         self.collection = self.db[COLLECTION_NAME]
         self.known_faces = []
         self.next_id = 1
+        self.last_refresh = 0
         self.refresh_local_cache()
 
     def refresh_local_cache(self):
+        if time.time() - self.last_refresh < 2: return
+
         self.known_faces = []
         cursor = self.collection.find()
         max_id = 0
@@ -83,38 +138,57 @@ class SmartFaceDB:
                 except ValueError:
                     pass
         self.next_id = max_id + 1
-        print(f"Loaded {len(self.known_faces)} faces. Next ID: {self.next_id}")
+        self.last_refresh = time.time()
 
-    def find_or_create(self, new_embedding, age, gender, distance, pose_status):
+    def find_match(self, new_embedding):
+        """Only checks DB. Returns (Name, Score) or (None, 0.0)"""
+        self.refresh_local_cache()
         new_norm = new_embedding / norm(new_embedding)
-
-        current_threshold = SIMILARITY_THRESHOLD
-        if distance > 1.5: current_threshold = 0.45
 
         best_score = -1
         best_match = None
 
         for face in self.known_faces:
+            # SKIP BANNED FACES
+            if face['name'] == "IGNORE":
+                if np.dot(new_norm, face['embedding']) > 0.6:
+                    return "Ignored", 0.0, "U", 0, (128, 128, 128)
+                continue
+
             score = np.dot(new_norm, face['embedding'])
             if score > best_score:
                 best_score = score
                 best_match = face
 
-        if best_score > current_threshold:
+        # Dynamic Threshold (Standard 0.5)
+        if best_score > SIMILARITY_THRESHOLD:
             return best_match['name'], best_score, best_match['gender'], best_match['age'], (0, 255, 0)
 
-        if distance > 1.5:
-            return "Too Far", best_score, "U", 0, (0, 0, 255)
+        return None, best_score, "U", 0, (0, 0, 255)  # Unknown
 
-        if pose_status != "Center":
-            return "Turn Head!", best_score, "U", 0, (0, 255, 255)
+    def register_new(self, new_embedding, age, gender, face_img):
+        """Creates new entry. Only call this after passing checks!"""
+        new_norm = new_embedding / norm(new_embedding)
+
+        # Save Thumbnail
+        img_str = ""
+        try:
+            if face_img is not None and face_img.size > 0:
+                h, w, _ = face_img.shape
+                scale = min(100 / w, 100 / h)
+                if scale < 1: face_img = cv2.resize(face_img, (0, 0), fx=scale, fy=scale)
+                _, buffer = cv2.imencode('.jpg', face_img)
+                img_str = base64.b64encode(buffer).decode('utf-8')
+        except:
+            pass
 
         new_name = f"Person_{self.next_id}"
         gender_str = "M" if gender == 1 else "F"
 
         new_doc = {
             "name": new_name, "embedding": new_embedding.tolist(),
-            "age": int(age), "gender": gender_str, "created_at": "now"
+            "age": int(age), "gender": gender_str,
+            "thumbnail": img_str, "created_at": "now"
         }
         self.collection.insert_one(new_doc)
 
@@ -122,12 +196,20 @@ class SmartFaceDB:
             'name': new_name, 'embedding': new_norm, 'age': int(age), 'gender': gender_str
         })
         self.next_id += 1
-        return new_name, best_score, gender_str, int(age), (0, 255, 0)
+        print(f"✅ Registered New User: {new_name}")
+        return new_name
 
 
 # ==========================================
-# PART 3: Helper Functions
+# PART 4: Helper Functions
 # ==========================================
+def get_blur_score(image):
+    """Returns variance of Laplacian. Lower = Blurrier."""
+    if image is None or image.size == 0: return 0
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+
 def estimate_yaw(landmarks):
     if landmarks is None: return "Unknown"
     left_eye, right_eye, nose = landmarks[0], landmarks[1], landmarks[2]
@@ -147,30 +229,25 @@ def is_inside_zed_box(face_box, zed_objects):
     face_area = (fx2 - fx1) * (fy2 - fy1)
 
     for obj in zed_objects:
-        if obj.label != sl.OBJECT_CLASS.PERSON:
-            continue
-
+        if obj.label != sl.OBJECT_CLASS.PERSON: continue
         raw_box = obj.bounding_box_2d
         zx1 = min(raw_box[0][0], raw_box[3][0])
         zy1 = min(raw_box[0][1], raw_box[1][1])
         zx2 = max(raw_box[1][0], raw_box[2][0])
         zy2 = max(raw_box[2][1], raw_box[3][1])
 
-        ix1 = max(fx1, zx1)
-        iy1 = max(fy1, zy1)
-        ix2 = min(fx2, zx2)
-        iy2 = min(fy2, zy2)
+        ix1, iy1 = max(fx1, zx1), max(fy1, zy1)
+        ix2, iy2 = min(fx2, zx2), min(fy2, zy2)
 
         if ix2 > ix1 and iy2 > iy1:
             intersection = (ix2 - ix1) * (iy2 - iy1)
             if intersection / face_area > 0.3:
                 return True, obj.id
-
     return False, None
 
 
 # ==========================================
-# PART 4: Main Loop
+# PART 5: Main Loop
 # ==========================================
 def main():
     print("Loading AI Models...")
@@ -182,6 +259,8 @@ def main():
         return
     enhancer = FaceEnhancer()
     db = SmartFaceDB()
+    tracker = FaceTracker(max_history=10)
+    reg_buffer = RegistrationBuffer(frames_needed=10)  # Wait ~10 frames before adding
 
     print("Opening ZED Camera...")
     zed = sl.Camera()
@@ -189,31 +268,16 @@ def main():
     init_params.camera_resolution = sl.RESOLUTION.HD720
     init_params.depth_mode = sl.DEPTH_MODE.PERFORMANCE
     init_params.coordinate_units = sl.UNIT.METER
+    if zed.open(init_params) != sl.ERROR_CODE.SUCCESS: return
 
-    if zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
-        print("❌ ZED Error")
-        return
-
-    # --- 1. ENABLE POSITIONAL TRACKING (REQUIRED FOR OBJECT DETECTION) ---
-    print("Enabling Positional Tracking...")
     pos_tracking_param = sl.PositionalTrackingParameters()
-    # If you want the camera to remember map (SLAM), set enable_area_memory=True
     pos_tracking_param.enable_area_memory = False
+    zed.enable_positional_tracking(pos_tracking_param)
 
-    if zed.enable_positional_tracking(pos_tracking_param) != sl.ERROR_CODE.SUCCESS:
-        print("❌ Positional Tracking Failed")
-        return
-
-    # --- 2. ENABLE OBJECT DETECTION ---
-    print("Enabling ZED Object Detection...")
     obj_param = sl.ObjectDetectionParameters()
     obj_param.detection_model = sl.OBJECT_DETECTION_MODEL.MULTI_CLASS_BOX_MEDIUM
     obj_param.enable_tracking = True
-    obj_param.enable_segmentation = False
-
-    if zed.enable_object_detection(obj_param) != sl.ERROR_CODE.SUCCESS:
-        print("❌ Object Detection Failed to Enable")
-        return
+    zed.enable_object_detection(obj_param)
 
     rt_params = sl.RuntimeParameters()
     obj_runtime_param = sl.ObjectDetectionRuntimeParameters()
@@ -223,7 +287,7 @@ def main():
     depth_zed = sl.Mat()
     objects = sl.Objects()
 
-    print("\n✅ System Running!")
+    print("\n✅ System Running! (Stricter Registration Enabled)")
 
     while True:
         if zed.grab(rt_params) == sl.ERROR_CODE.SUCCESS:
@@ -240,13 +304,11 @@ def main():
                 box = face.bbox.astype(int)
                 face_width = box[2] - box[0]
 
-                # Check Reality (ZED Cross-Reference)
+                # 1. Check Reality (ZED)
                 is_real_person, zed_id = is_inside_zed_box(box, objects.object_list)
-
                 if not is_real_person:
                     cv2.rectangle(frame_bgr, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 2)
-                    cv2.putText(frame_bgr, "FAKE / NO BODY", (box[0], box[1] - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    cv2.putText(frame_bgr, "FAKE", (box[0], box[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                     continue
 
                 center_x = int((box[0] + box[2]) / 2)
@@ -256,6 +318,15 @@ def main():
 
                 pose_status = estimate_yaw(face.kps)
 
+                # 2. Get Face Crop & Blur Score
+                h, w, _ = frame_bgr.shape
+                cx1, cy1 = max(0, box[0]), max(0, box[1])
+                cx2, cy2 = min(w, box[2]), min(h, box[3])
+                face_crop = frame_bgr[cy1:cy2, cx1:cx2]
+
+                blur_score = get_blur_score(face_crop)
+
+                # 3. Enhance if needed
                 embedding_to_use = face.embedding
                 was_enhanced = False
                 if face_width < 60 or distance > 2.0:
@@ -265,27 +336,51 @@ def main():
                         if len(results_high_res) > 0:
                             embedding_to_use = results_high_res[0].embedding
                             was_enhanced = True
+                            face_crop = restored_face
+                            blur_score = 999  # Enhanced faces are artificial, assume good
 
-                name, score, gender, age, color = db.find_or_create(
-                    embedding_to_use, face.age, face.gender, distance, pose_status
-                )
+                # 4. Check DB (No Creation yet)
+                name, score, gender, age, color = db.find_match(embedding_to_use)
 
+                if name:
+                    # Known Person
+                    reg_buffer.reset(zed_id)  # Reset counter
+                    tracker.update(zed_id, name)
+                    final_name = tracker.get_stable_name(zed_id)
+                else:
+                    # Unknown Person - Should we register?
+                    final_name = "Unknown"
+                    color = (0, 165, 255)  # Orange
+
+                    # --- STRICT REGISTRATION LOGIC ---
+                    if zed_id is not None:
+                        # Only track if face is clear
+                        if blur_score > BLUR_THRESHOLD and pose_status == "Center":
+                            ready_to_register = reg_buffer.update(zed_id)
+
+                            if ready_to_register:
+                                new_name = db.register_new(embedding_to_use, face.age, face.gender, face_crop)
+                                tracker.update(zed_id, new_name)
+                                final_name = new_name
+                                reg_buffer.reset(zed_id)
+                        else:
+                            # If blurry/side-view, pause registration
+                            pass
+
+                # Draw
                 cv2.rectangle(frame_bgr, (box[0], box[1]), (box[2], box[3]), color, 2)
-                if was_enhanced:
-                    cv2.circle(frame_bgr, (box[0], box[1]), 5, (255, 255, 0), -1)
+                if was_enhanced: cv2.circle(frame_bgr, (box[0], box[1]), 5, (255, 255, 0), -1)
 
-                label_top = f"{name} ({distance:.1f}m)"
-                cv2.putText(frame_bgr, label_top, (box[0], box[1] - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                label_top = f"{final_name} ({distance:.1f}m)"
+                cv2.putText(frame_bgr, label_top, (box[0], box[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-                label_bot = f"{pose_status} | Conf: {score:.2f}"
-                cv2.putText(frame_bgr, label_bot, (box[0], box[3] + 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                # Show Blur Score for debugging
+                label_bot = f"Blur: {int(blur_score)} | {pose_status}"
+                cv2.putText(frame_bgr, label_bot, (box[0], box[3] + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200),
+                            1)
 
             cv2.imshow("ZED Final System", frame_bgr)
-
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+            if cv2.waitKey(1) & 0xFF == ord('q'): break
 
     zed.close()
     cv2.destroyAllWindows()
