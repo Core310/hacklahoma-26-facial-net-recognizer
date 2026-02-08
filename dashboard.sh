@@ -1,1 +1,1 @@
-streamlit run dashboard.py
+streamlit run flask_dashboard.py

@@ -1,3 +1,5 @@
+# Facial saver (no for fc2 manual no camera)
+
 import cv2
 import pyzed.sl as sl
 import numpy as np
