@@ -1,7 +1,7 @@
 import streamlit as st
 import pymongo
 import base64
-import numpy as np
+from collections import defaultdict
 
 # --- Configuration ---
 MONGO_URI = "mongodb://localhost:27017/"
@@ -22,85 +22,87 @@ client = init_connection()
 db = client[DB_NAME]
 collection = db[COLLECTION_NAME]
 
-# --- Sidebar Actions ---
-st.sidebar.header("Actions")
+# --- Sidebar: Merge Tool ---
+st.sidebar.header("🛠️ Merge Tool")
+st.sidebar.info("Combine multiple 'Person_X' entries into one Identity.")
+
+# Fetch all unique names
+all_docs = list(collection.find())
+unique_names = sorted(list(set(d['name'] for d in all_docs)))
+
+# Multi-Select for Merge
+merge_targets = st.sidebar.multiselect("Select identities to merge:", unique_names)
+target_name = st.sidebar.text_input("New Name for all:", placeholder="e.g. Arika")
+
+if st.sidebar.button("Merge Selected"):
+    if not target_name or not merge_targets:
+        st.sidebar.error("Select names and enter a target!")
+    else:
+        # Update MongoDB
+        result = collection.update_many(
+            {"name": {"$in": merge_targets}},
+            {"$set": {"name": target_name}}
+        )
+        st.sidebar.success(f"✅ Merged {result.modified_count} vectors into '{target_name}'!")
+        st.rerun()
+
+st.sidebar.divider()
 if st.sidebar.button("🔄 Refresh Data"):
     st.rerun()
 
-st.sidebar.markdown("---")
-st.sidebar.error("Danger Zone")
 if st.sidebar.button("🗑️ DELETE ALL DATA"):
     collection.drop()
     st.warning("Database Wiped!")
     st.rerun()
 
-# --- Main Interface ---
-# Fetch all faces
-faces = list(collection.find())
+# --- Main Interface: Grouped View ---
+st.header("Identities Gallery")
 
-if not faces:
-    st.info("Database is empty. Run main.py and register some faces!")
+if not all_docs:
+    st.info("Database is empty. Run main.py and look at the camera!")
 else:
-    st.write(f"Found {len(faces)} identities in database.")
+    # Group docs by Name
+    grouped = defaultdict(list)
+    for doc in all_docs:
+        grouped[doc['name']].append(doc)
 
-    # Display in a grid
-    cols = st.columns(4)  # 4 items per row
+    # Sort groups by name (Arika first, Person_X last)
+    sorted_names = sorted(grouped.keys())
 
-    for idx, face in enumerate(faces):
-        with cols[idx % 4]:
-            # Container for each face
-            with st.container(border=True):
-                # 1. Show Image
-                if "thumbnail" in face and face['thumbnail']:
-                    try:
-                        img_bytes = base64.b64decode(face['thumbnail'])
-                        st.image(img_bytes, width=100)
-                    except:
-                        st.text("Bad Image")
-                else:
-                    st.text("No Image")
+    for name in sorted_names:
+        vectors = grouped[name]
 
-                # 2. Edit Name
-                current_name = face['name']
-                # Create a unique key for each input box
-                new_name = st.text_input(f"ID: {str(face['_id'])[-5:]}", value=current_name, key=f"name_{idx}")
+        # Identity Header
+        with st.expander(f"👤 **{name}** ({len(vectors)} vectors/photos)", expanded=True):
 
-                # 3. Save Button
-                if new_name != current_name:
-                    collection.update_one({"_id": face["_id"]}, {"$set": {"name": new_name}})
-                    st.toast(f"Renamed to {new_name}!")
-                    # We don't rerun immediately to let you edit others,
-                    # but next refresh will show it.
+            # Show Gallery of Faces for this Person
+            cols = st.columns(6)  # 6 images per row
+            for idx, doc in enumerate(vectors):
+                with cols[idx % 6]:
+                    # Display Image
+                    if "thumbnail" in doc and doc['thumbnail']:
+                        try:
+                            img_bytes = base64.b64decode(doc['thumbnail'])
+                            st.image(img_bytes, width=80)
+                        except:
+                            st.text("Err")
+                    else:
+                        st.caption("No Img")
 
-                # 4. Delete Individual
-                st.caption(f"Age: {face.get('age', '?')} | {face.get('gender', '?')}")
+                    # Individual Stats
+                    st.caption(f"{doc.get('gender', '?')} | {doc.get('age', '?')}yo")
 
-                if st.button("Delete", key=f"del_{idx}"):
-                    collection.delete_one({"_id": face["_id"]})
+                    # Delete Single Vector button
+                    if st.button("x", key=f"del_{doc['_id']}", help="Delete this specific photo/vector"):
+                        collection.delete_one({"_id": doc["_id"]})
+                        st.rerun()
+
+            # Rename Entire Group
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                new_group_name = st.text_input("Rename this Identity:", value=name, key=f"ren_{name}")
+            with col2:
+                if st.button("Update Name", key=f"btn_{name}"):
+                    collection.update_many({"name": name}, {"$set": {"name": new_group_name}})
+                    st.success("Renamed!")
                     st.rerun()
-
-# --- Batch Merge Tool ---
-st.divider()
-st.header("Batch Merge Tool")
-st.write("Select multiple IDs to merge them into a single person.")
-
-# Create list for dropdown: "Name (ID: ...)"
-# We store the FULL _id in a hidden way to make matching robust
-id_map = {f"{f['name']} (ID: {str(f['_id'])[-5:]})": f['_id'] for f in faces}
-options = list(id_map.keys())
-
-selected_labels = st.multiselect("Select duplicates:", options)
-target_name = st.text_input("Merge all selected into this Name:", placeholder="e.g. Arika")
-
-if st.button("Merge All Selected"):
-    if not target_name:
-        st.error("Please enter a target name.")
-    else:
-        count = 0
-        for label in selected_labels:
-            real_id = id_map[label]
-            collection.update_one({"_id": real_id}, {"$set": {"name": target_name}})
-            count += 1
-
-        st.success(f"Merged {count} faces into '{target_name}'!")
-        st.rerun()

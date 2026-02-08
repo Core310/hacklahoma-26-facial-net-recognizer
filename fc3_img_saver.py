@@ -9,6 +9,7 @@ import os
 import math
 import base64
 import time
+from collections import deque, Counter  # <--- NEW IMPORTS FOR TRACKER
 
 # --- Configuration ---
 MONGO_URI = "mongodb://localhost:27017/"
@@ -54,7 +55,39 @@ class FaceEnhancer:
 
 
 # ==========================================
-# PART 2: Database Logic
+# PART 2: Face Tracker (Temporal Voting)
+# ==========================================
+class FaceTracker:
+    def __init__(self, max_history=10):
+        self.max_history = max_history
+        # Dictionary: { zed_id : deque(['Arika', 'Arika', 'Unknown']) }
+        self.history = {}
+
+    def update(self, zed_id, name):
+        """Adds a new guess to the history for this person."""
+        if zed_id not in self.history:
+            self.history[zed_id] = deque(maxlen=self.max_history)
+        self.history[zed_id].append(name)
+
+    def get_stable_name(self, zed_id):
+        """Returns the most frequent name in recent history."""
+        if zed_id not in self.history or not self.history[zed_id]:
+            return "Scanning..."
+
+        # Count votes
+        votes = Counter(self.history[zed_id])
+        winner, count = votes.most_common(1)[0]
+
+        # Stability Check: Only return name if >50% of frames agree
+        if count / len(self.history[zed_id]) > 0.5:
+            return winner
+        else:
+            return "Verifying..."
+
+        # ==========================================
+
+
+# PART 3: Database Logic
 # ==========================================
 class SmartFaceDB:
     def __init__(self):
@@ -67,8 +100,8 @@ class SmartFaceDB:
         self.refresh_local_cache()
 
     def refresh_local_cache(self):
-        # Refresh every 5 seconds to pick up renames from Dashboard
-        if time.time() - self.last_refresh < 5:
+        # Refresh every 2 seconds to pick up renames from Dashboard quickly
+        if time.time() - self.last_refresh < 2:
             return
 
         self.known_faces = []
@@ -90,12 +123,9 @@ class SmartFaceDB:
                     pass
         self.next_id = max_id + 1
         self.last_refresh = time.time()
-        # Silent update (don't spam console)
 
     def find_or_create(self, new_embedding, age, gender, distance, pose_status, face_img):
-        # Check for updates from Dashboard
         self.refresh_local_cache()
-
         new_norm = new_embedding / norm(new_embedding)
 
         current_threshold = SIMILARITY_THRESHOLD
@@ -123,12 +153,10 @@ class SmartFaceDB:
         img_str = ""
         try:
             if face_img is not None and face_img.size > 0:
-                # Resize to max 100x100 to save space
                 img_h, img_w, _ = face_img.shape
                 scale = min(100 / img_w, 100 / img_h)
                 if scale < 1:
                     face_img = cv2.resize(face_img, (0, 0), fx=scale, fy=scale)
-
                 _, buffer = cv2.imencode('.jpg', face_img)
                 img_str = base64.b64encode(buffer).decode('utf-8')
         except Exception:
@@ -152,7 +180,7 @@ class SmartFaceDB:
 
 
 # ==========================================
-# PART 3: Helper Functions
+# PART 4: Helper Functions
 # ==========================================
 def estimate_yaw(landmarks):
     if landmarks is None: return "Unknown"
@@ -175,7 +203,6 @@ def is_inside_zed_box(face_box, zed_objects):
     for obj in zed_objects:
         if obj.label != sl.OBJECT_CLASS.PERSON:
             continue
-
         raw_box = obj.bounding_box_2d
         zx1 = min(raw_box[0][0], raw_box[3][0])
         zy1 = min(raw_box[0][1], raw_box[1][1])
@@ -191,12 +218,11 @@ def is_inside_zed_box(face_box, zed_objects):
             intersection = (ix2 - ix1) * (iy2 - iy1)
             if intersection / face_area > 0.3:
                 return True, obj.id
-
     return False, None
 
 
 # ==========================================
-# PART 4: Main Loop
+# PART 5: Main Loop
 # ==========================================
 def main():
     print("Loading AI Models...")
@@ -208,6 +234,7 @@ def main():
         return
     enhancer = FaceEnhancer()
     db = SmartFaceDB()
+    tracker = FaceTracker(max_history=10)  # <--- Init Tracker
 
     print("Opening ZED Camera...")
     zed = sl.Camera()
@@ -281,8 +308,7 @@ def main():
                 embedding_to_use = face.embedding
                 was_enhanced = False
 
-                # --- CAPTURE CROP FOR DASHBOARD ---
-                # Ensure coordinates are within image bounds
+                # Capture Crop for Dashboard
                 h, w, _ = frame_bgr.shape
                 cx1, cy1 = max(0, box[0]), max(0, box[1])
                 cx2, cy2 = min(w, box[2]), min(h, box[3])
@@ -296,18 +322,28 @@ def main():
                         if len(results_high_res) > 0:
                             embedding_to_use = results_high_res[0].embedding
                             was_enhanced = True
-                            # If enhanced, save the nice enhanced image instead of the blurry one
                             face_crop = restored_face
 
+                # DB Lookup (Instant Guess)
                 name, score, gender, age, color = db.find_or_create(
                     embedding_to_use, face.age, face.gender, distance, pose_status, face_crop
                 )
 
+                # --- TRACKER LOGIC (Stable Guess) ---
+                if zed_id is not None:
+                    # Feed the instant guess into the tracker
+                    tracker.update(zed_id, name)
+                    # Get the smoothed result
+                    final_name = tracker.get_stable_name(zed_id)
+                else:
+                    final_name = name  # Fallback
+
+                # Draw
                 cv2.rectangle(frame_bgr, (box[0], box[1]), (box[2], box[3]), color, 2)
                 if was_enhanced:
                     cv2.circle(frame_bgr, (box[0], box[1]), 5, (255, 255, 0), -1)
 
-                label_top = f"{name} ({distance:.1f}m)"
+                label_top = f"{final_name} ({distance:.1f}m)"
                 cv2.putText(frame_bgr, label_top, (box[0], box[1] - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
