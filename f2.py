@@ -21,7 +21,6 @@ SIMILARITY_THRESHOLD = 0.5
 # ==========================================
 class FaceEnhancer:
     def __init__(self):
-        # upscale=2 means it turns a 50px face into a 100px face
         self.restorer = GFPGANer(
             model_path=GFPGAN_MODEL_PATH,
             upscale=2,
@@ -31,13 +30,9 @@ class FaceEnhancer:
         )
 
     def enhance(self, full_frame, box):
-        """
-        Crops the face, upscales it, and returns the restored face image.
-        """
         x1, y1, x2, y2 = box
         h, w, _ = full_frame.shape
 
-        # Add padding to help the model see context (hair/chin)
         pad = 10
         x1 = max(0, x1 - pad)
         y1 = max(0, y1 - pad)
@@ -45,16 +40,15 @@ class FaceEnhancer:
         y2 = min(h, y2 + pad)
 
         face_crop = full_frame[y1:y2, x1:x2]
-
         if face_crop.size == 0: return None
 
-        # Run GFPGAN
-        # cropped_faces, restored_faces, restored_img
-        _, restored_faces, _ = self.restorer.enhance(face_crop, has_aligned=False, only_center_face=False,
-                                                     paste_back=False)
-
-        if restored_faces:
-            return restored_faces[0]  # Return the first restored face found
+        try:
+            _, restored_faces, _ = self.restorer.enhance(face_crop, has_aligned=False, only_center_face=False,
+                                                         paste_back=False)
+            if restored_faces:
+                return restored_faces[0]
+        except Exception:
+            pass
         return None
 
 
@@ -71,7 +65,6 @@ class SmartFaceDB:
         self.refresh_local_cache()
 
     def refresh_local_cache(self):
-        """Loads all identities from MongoDB into RAM for fast matching."""
         self.known_faces = []
         cursor = self.collection.find()
         max_id = 0
@@ -83,7 +76,6 @@ class SmartFaceDB:
                 'age': doc.get('age', 0),
                 'gender': doc.get('gender', 'U')
             })
-            # Track ID number to auto-increment Person_X
             if doc['name'].startswith("Person_"):
                 try:
                     curr_id = int(doc['name'].split("_")[1])
@@ -94,207 +86,203 @@ class SmartFaceDB:
         print(f"Loaded {len(self.known_faces)} faces. Next ID: {self.next_id}")
 
     def find_or_create(self, new_embedding, age, gender, distance, pose_status):
-        """
-        Matches face against DB.
-        Creates new entry ONLY if:
-        1. No match found
-        2. User is close (< 1.5m)
-        3. User is looking straight (Center)
-        """
         new_norm = new_embedding / norm(new_embedding)
 
-        # DYNAMIC THRESHOLD: Be looser if far away (0.45), stricter if close (0.5)
         current_threshold = SIMILARITY_THRESHOLD
         if distance > 1.5: current_threshold = 0.45
 
         best_score = -1
         best_match = None
 
-        # 1. Search Known Faces
         for face in self.known_faces:
             score = np.dot(new_norm, face['embedding'])
             if score > best_score:
                 best_score = score
                 best_match = face
 
-        # 2. MATCH FOUND?
         if best_score > current_threshold:
             return best_match['name'], best_score, best_match['gender'], best_match['age'], (0, 255, 0)
 
-        # 3. REGISTRATION GUARDS
-        # Don't create new person if too far
         if distance > 1.5:
-            return "Too Far", best_score, "U", 0, (0, 0, 255)  # Red
+            return "Too Far", best_score, "U", 0, (0, 0, 255)
 
-        # Don't create new person if looking sideways (Bad data)
         if pose_status != "Center":
-            return "Turn Head!", best_score, "U", 0, (0, 255, 255)  # Yellow
+            return "Turn Head!", best_score, "U", 0, (0, 255, 255)
 
-        # 4. CREATE NEW IDENTITY
         new_name = f"Person_{self.next_id}"
         gender_str = "M" if gender == 1 else "F"
 
         new_doc = {
-            "name": new_name,
-            "embedding": new_embedding.tolist(),
-            "age": int(age),
-            "gender": gender_str,
-            "created_at": "now"
+            "name": new_name, "embedding": new_embedding.tolist(),
+            "age": int(age), "gender": gender_str, "created_at": "now"
         }
         self.collection.insert_one(new_doc)
 
-        # Add to local cache
         self.known_faces.append({
-            'name': new_name,
-            'embedding': new_norm,
-            'age': int(age),
-            'gender': gender_str
+            'name': new_name, 'embedding': new_norm, 'age': int(age), 'gender': gender_str
         })
-
         self.next_id += 1
-        return new_name, best_score, gender_str, int(age), (0, 255, 0)  # Green
+        return new_name, best_score, gender_str, int(age), (0, 255, 0)
 
 
 # ==========================================
 # PART 3: Helper Functions
 # ==========================================
 def estimate_yaw(landmarks):
-    """
-    Estimates if head is turned Left/Right based on nose position relative to eyes.
-    landmarks format: 5 points (LeftEye, RightEye, Nose, LeftMouth, RightMouth)
-    """
     if landmarks is None: return "Unknown"
-
-    left_eye = landmarks[0]
-    right_eye = landmarks[1]
-    nose = landmarks[2]
-
+    left_eye, right_eye, nose = landmarks[0], landmarks[1], landmarks[2]
     dist_left = nose[0] - left_eye[0]
     total_dist = right_eye[0] - left_eye[0]
-
     if total_dist == 0: return "Center"
-
     ratio = dist_left / total_dist
-
-    # Ratios: <0.35 means looking Right (camera perspective). >0.65 means looking Left.
     if ratio < 0.35:
         return "Right"
     elif ratio > 0.65:
         return "Left"
-    else:
-        return "Center"
+    return "Center"
+
+
+def is_inside_zed_box(face_box, zed_objects):
+    fx1, fy1, fx2, fy2 = face_box
+    face_area = (fx2 - fx1) * (fy2 - fy1)
+
+    for obj in zed_objects:
+        if obj.label != sl.OBJECT_CLASS.PERSON:
+            continue
+
+        raw_box = obj.bounding_box_2d
+        zx1 = min(raw_box[0][0], raw_box[3][0])
+        zy1 = min(raw_box[0][1], raw_box[1][1])
+        zx2 = max(raw_box[1][0], raw_box[2][0])
+        zy2 = max(raw_box[2][1], raw_box[3][1])
+
+        ix1 = max(fx1, zx1)
+        iy1 = max(fy1, zy1)
+        ix2 = min(fx2, zx2)
+        iy2 = min(fy2, zy2)
+
+        if ix2 > ix1 and iy2 > iy1:
+            intersection = (ix2 - ix1) * (iy2 - iy1)
+            if intersection / face_area > 0.3:
+                return True, obj.id
+
+    return False, None
 
 
 # ==========================================
 # PART 4: Main Loop
 # ==========================================
 def main():
-    # 1. Initialize AI Models
-    print("Loading ArcFace...")
+    print("Loading AI Models...")
     app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider'])
     app.prepare(ctx_id=0, det_size=(640, 640))
 
-    print("Loading GFPGAN (Super Resolution)...")
     if not os.path.exists(GFPGAN_MODEL_PATH):
         print(f"❌ Error: {GFPGAN_MODEL_PATH} not found!")
         return
     enhancer = FaceEnhancer()
-
-    print("Connecting to Database...")
     db = SmartFaceDB()
 
-    # 2. Initialize ZED Camera
     print("Opening ZED Camera...")
     zed = sl.Camera()
     init_params = sl.InitParameters()
     init_params.camera_resolution = sl.RESOLUTION.HD720
-    # NEURAL depth mode is slower but much better for long-range accuracy
-    init_params.depth_mode = sl.DEPTH_MODE.NEURAL
+    init_params.depth_mode = sl.DEPTH_MODE.PERFORMANCE
     init_params.coordinate_units = sl.UNIT.METER
 
     if zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
-        print("❌ ZED Error: Could not open camera.")
+        print("❌ ZED Error")
+        return
+
+    # --- 1. ENABLE POSITIONAL TRACKING (REQUIRED FOR OBJECT DETECTION) ---
+    print("Enabling Positional Tracking...")
+    pos_tracking_param = sl.PositionalTrackingParameters()
+    # If you want the camera to remember map (SLAM), set enable_area_memory=True
+    pos_tracking_param.enable_area_memory = False
+
+    if zed.enable_positional_tracking(pos_tracking_param) != sl.ERROR_CODE.SUCCESS:
+        print("❌ Positional Tracking Failed")
+        return
+
+    # --- 2. ENABLE OBJECT DETECTION ---
+    print("Enabling ZED Object Detection...")
+    obj_param = sl.ObjectDetectionParameters()
+    obj_param.detection_model = sl.OBJECT_DETECTION_MODEL.MULTI_CLASS_BOX_MEDIUM
+    obj_param.enable_tracking = True
+    obj_param.enable_segmentation = False
+
+    if zed.enable_object_detection(obj_param) != sl.ERROR_CODE.SUCCESS:
+        print("❌ Object Detection Failed to Enable")
         return
 
     rt_params = sl.RuntimeParameters()
+    obj_runtime_param = sl.ObjectDetectionRuntimeParameters()
+    obj_runtime_param.detection_confidence_threshold = 40
+
     image_zed = sl.Mat()
     depth_zed = sl.Mat()
+    objects = sl.Objects()
 
     print("\n✅ System Running!")
-    print("   [Q] Quit")
 
     while True:
         if zed.grab(rt_params) == sl.ERROR_CODE.SUCCESS:
-            # A. Retrieve Data
             zed.retrieve_image(image_zed, sl.VIEW.LEFT)
             zed.retrieve_measure(depth_zed, sl.MEASURE.DEPTH)
+            zed.retrieve_objects(objects, obj_runtime_param)
 
             frame_bgra = image_zed.get_data()
-            frame_bgr = frame_bgra[:, :, :3].copy()  # Fix memory layout
+            frame_bgr = frame_bgra[:, :, :3].copy()
 
-            # B. Detect Faces (Initial Pass)
             faces = app.get(frame_bgr)
 
             for face in faces:
                 box = face.bbox.astype(int)
                 face_width = box[2] - box[0]
 
-                # --- 1. Get Distance (ZED) ---
+                # Check Reality (ZED Cross-Reference)
+                is_real_person, zed_id = is_inside_zed_box(box, objects.object_list)
+
+                if not is_real_person:
+                    cv2.rectangle(frame_bgr, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 2)
+                    cv2.putText(frame_bgr, "FAKE / NO BODY", (box[0], box[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    continue
+
                 center_x = int((box[0] + box[2]) / 2)
                 center_y = int((box[1] + box[3]) / 2)
-                h, w, _ = frame_bgr.shape
-                center_x = max(0, min(center_x, w - 1))
-                center_y = max(0, min(center_y, h - 1))
-
                 err, distance = depth_zed.get_value(center_x, center_y)
                 if not np.isfinite(distance) or distance <= 0: distance = 10.0
 
-                # --- 2. Check Pose (Angle) ---
                 pose_status = estimate_yaw(face.kps)
 
-                # --- 3. Super Resolution (Distance Fix) ---
                 embedding_to_use = face.embedding
                 was_enhanced = False
-
-                # Logic: If face is small (<60px) OR far away (>2m), try to fix it
                 if face_width < 60 or distance > 2.0:
                     restored_face = enhancer.enhance(frame_bgr, box)
-
                     if restored_face is not None:
-                        # Re-run ArcFace on the clean, upscaled face
                         results_high_res = app.get(restored_face)
-
                         if len(results_high_res) > 0:
-                            # Success! Use the high-res embedding
                             embedding_to_use = results_high_res[0].embedding
                             was_enhanced = True
 
-                # --- 4. Identify (Database) ---
                 name, score, gender, age, color = db.find_or_create(
                     embedding_to_use, face.age, face.gender, distance, pose_status
                 )
 
-                # --- 5. Draw Visuals ---
-                # Box
                 cv2.rectangle(frame_bgr, (box[0], box[1]), (box[2], box[3]), color, 2)
-
-                # Markers
                 if was_enhanced:
-                    # Cyan dot = Enhanced by AI
                     cv2.circle(frame_bgr, (box[0], box[1]), 5, (255, 255, 0), -1)
 
-                    # Text Labels
-                # Top: Name + Distance
                 label_top = f"{name} ({distance:.1f}m)"
                 cv2.putText(frame_bgr, label_top, (box[0], box[1] - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-                # Bottom: Pose + Score
                 label_bot = f"{pose_status} | Conf: {score:.2f}"
                 cv2.putText(frame_bgr, label_bot, (box[0], box[3] + 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-            cv2.imshow("ZED Smart ID System", frame_bgr)
+            cv2.imshow("ZED Final System", frame_bgr)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
